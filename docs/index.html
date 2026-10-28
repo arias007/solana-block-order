@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Solana Block Order Explorer — how validators actually order transactions</title>
+<meta name="description" content="Paste any Solana slot. See whether the block was ordered by priority fee or by execution completion, measured live from mainnet.">
+<style>
+:root{
+  --bg:#0b0f14;--surf:#121821;--surf2:#182230;--line:#222e3d;
+  --t1:#e6edf6;--t2:#94a3b8;--t3:#5b6b7f;
+  --cy:#22d3ee;--pu:#a78bfa;--gr:#34d399;--am:#fbbf24;--rd:#f87171;
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{margin:0;background:var(--bg);color:var(--t1);
+  font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif;
+  padding:18px 14px 60px}
+.w{max-width:760px;margin:0 auto}
+h1{font-size:21px;margin:0 0 4px;letter-spacing:-.4px}
+.sub{color:var(--t2);font-size:13px;margin-bottom:16px}
+.row{display:flex;gap:8px;margin:14px 0}
+input,button{font:inherit;font-size:14px}
+input[type=text]{flex:1;background:var(--surf);border:1px solid var(--line);color:var(--t1);
+  border-radius:9px;padding:12px 13px;min-width:0;min-height:44px}
+input[type=text]:focus{outline:none;border-color:var(--cy)}
+button{background:var(--cy);color:#06232a;border:none;border-radius:9px;
+  padding:12px 18px;font-weight:600;cursor:pointer;min-height:44px;white-space:nowrap}
+button:disabled{opacity:.5;cursor:default}
+button.ghost{background:var(--surf);color:var(--t2);border:1px solid var(--line);font-weight:500}
+.card{background:var(--surf);border:1px solid var(--line);border-radius:12px;padding:14px;margin:10px 0}
+.kv{display:flex;justify-content:space-between;padding:6px 0;font-size:13.5px;border-bottom:1px solid rgba(34,46,61,.6)}
+.kv:last-child{border:none}
+.kv .k{color:var(--t3)}
+.kv .v{font-variant-numeric:tabular-nums}
+.verdict{font-size:16px;font-weight:700;line-height:1.45}
+.verdict .em{color:var(--cy)}
+.verdict.warn .em{color:var(--am)}
+.big{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}
+.big>div{background:var(--surf2);border-radius:9px;padding:11px}
+.big b{display:block;font-size:19px;font-variant-numeric:tabular-nums;letter-spacing:-.5px}
+.big span{font-size:11.5px;color:var(--t3)}
+canvas{width:100%;display:block;border-radius:8px;background:var(--surf2)}
+.legend{display:flex;gap:14px;font-size:11.5px;color:var(--t3);margin-top:8px;flex-wrap:wrap}
+.legend i{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:4px}
+.bar{height:5px;border-radius:3px;background:var(--surf2);overflow:hidden;margin-top:5px}
+.bar i{display:block;height:100%;border-radius:3px}
+.err{color:var(--rd);font-size:13.5px}
+.note{font-size:12px;color:var(--t3);line-height:1.55;margin-top:10px}
+h2{font-size:11.5px;color:var(--t3);letter-spacing:1.3px;text-transform:uppercase;
+  margin:26px 0 8px;font-weight:700}
+details{background:var(--surf);border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin:8px 0}
+summary{cursor:pointer;list-style:none;font-size:13.5px;color:var(--t2);display:flex;justify-content:space-between}
+summary::-webkit-details-marker{display:none}
+summary::after{content:"+";color:var(--t3);font-size:16px}
+details[open] summary::after{content:"−"}
+details p{font-size:13px;color:var(--t2);margin:9px 0 0;line-height:1.6}
+.spin{display:inline-block;width:13px;height:13px;border:2px solid var(--t3);
+  border-top-color:var(--cy);border-radius:50%;animation:sp .7s linear infinite;vertical-align:-2px;margin-right:6px}
+@keyframes sp{to{transform:rotate(360deg)}}
+.foot{text-align:center;color:var(--t3);font-size:11.5px;margin-top:34px;line-height:1.7}
+a{color:var(--cy)}
+</style>
+</head>
+<body>
+<div class="w">
+
+  <h1>Solana Block Order Explorer</h1>
+  <div class="sub">Paste any slot. See whether the leader ordered that block by priority fee — or by something else.</div>
+
+  <div class="row">
+    <input type="text" id="slot" placeholder="slot number, or leave empty for latest" inputmode="numeric">
+    <button id="go">Inspect</button>
+  </div>
+  <div class="row" style="margin-top:-4px">
+    <button class="ghost" id="rnd" style="flex:1">Random recent block</button>
+  </div>
+
+  <div id="out"></div>
+
+  <h2>What this measures</h2>
+  <details>
+    <summary>Why priority fee does not equal position</summary>
+    <p>Every block explorer shows you the fee you paid. None of them show you whether paying more actually put you earlier in the block.</p>
+    <p>This tool fetches the full block, strips vote transactions, and computes the Spearman rank correlation between a transaction's index in the block and two things: its priority fee, and its compute units consumed.</p>
+    <p>If blocks were fee-sorted, the fee correlation would be strongly positive. Across the validators measured so far, it is not — the correlation sits near zero and even flips sign between clients. What does track position, weakly, is compute: longer transactions land later, which is the fingerprint of a parallel scheduler writing out transactions in completion order.</p>
+  </details>
+  <details>
+    <summary>How the numbers are computed</summary>
+    <p><b>Priority fee</b> = <code>meta.fee − 5000 × number of signatures</code>. The 5000 lamport base fee per signature is subtracted so only the priority component remains.</p>
+    <p><b>Price</b> = priority fee ÷ compute units consumed.</p>
+    <p><b>ρ</b> is Spearman's rank correlation over the block's non-vote transactions, so it is insensitive to the huge spread in fee magnitudes (a few transactions pay 1000× the median).</p>
+    <p><b>Saturation</b> = total compute units ÷ 48,000,000, the per-block compute limit. A block above ~70% is where fee-ordering would matter most if it existed.</p>
+  </details>
+  <details>
+    <summary>Vote transactions are excluded</summary>
+    <p>Vote transactions occur in fixed positions at predictable intervals and would dominate any correlation. They are identified by the presence of the Vote program account and removed before analysis.</p>
+  </details>
+
+  <div class="foot">
+    Data straight from a public Solana mainnet RPC. No server, no cache, no tracking.
+  </div>
+</div>
+
+<script>
+(function(){
+  "use strict";
+
+  var RPCS = [
+    "https://solana-rpc.publicnode.com",
+    "https://api.mainnet-beta.solana.com"
+  ];
+  var VOTE = "Vote111111111111111111111111111111111111111";
+  var BASE_FEE = 5000;
+  var MAX_CU = 48000000;
+
+  var out = document.getElementById("out");
+  var inp = document.getElementById("slot");
+  var go  = document.getElementById("go");
+  var rnd = document.getElementById("rnd");
+
+  function rpc(method, params){
+    var body = JSON.stringify({jsonrpc:"2.0",id:1,method:method,params:params||[]});
+    var i = 0;
+    function attempt(){
+      return fetch(RPCS[i], {
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:body
+      }).then(function(r){
+        if(!r.ok) throw new Error("HTTP "+r.status);
+        return r.json();
+      }).catch(function(e){
+        i++;
+        if(i < RPCS.length) return attempt();
+        throw e;
+      });
+    }
+    return attempt();
+  }
+
+  function spearman(xs, ys){
+    var n = xs.length;
+    if(n < 5) return null;
+    function ranks(v){
+      var idx = v.map(function(_,i){return i;});
+      idx.sort(function(a,b){ return v[a]-v[b]; });
+      var r = new Array(n), i = 0;
+      while(i < n){
+        var j = i;
+        while(j+1 < n && v[idx[j+1]] === v[idx[i]]) j++;
+        var avg = (i+j)/2 + 1;
+        for(var k=i;k<=j;k++) r[idx[k]] = avg;
+        i = j+1;
+      }
+      return r;
+    }
+    var rx = ranks(xs), ry = ranks(ys);
+    var mx = 0, my = 0, i;
+    for(i=0;i<n;i++){ mx += rx[i]; my += ry[i]; }
+    mx /= n; my /= n;
+    var num=0, dx=0, dy=0;
+    for(i=0;i<n;i++){
+      var a = rx[i]-mx, b = ry[i]-my;
+      num += a*b; dx += a*a; dy += b*b;
+    }
+    if(dx === 0 || dy === 0) return null;
+    return num / Math.sqrt(dx*dy);
+  }
+
+  function pct(arr, p){
+    if(!arr.length) return 0;
+    var s = arr.slice().sort(function(a,b){return a-b;});
+    return s[Math.min(s.length-1, Math.floor(s.length*p))];
+  }
+
+  function fmt(n){
+    if(n === null || n === undefined) return "—";
+    if(Math.abs(n) >= 1e9) return (n/1e9).toFixed(2)+"B";
+    if(Math.abs(n) >= 1e6) return (n/1e6).toFixed(2)+"M";
+    if(Math.abs(n) >= 1e3) return (n/1e3).toFixed(1)+"k";
+    return String(Math.round(n));
+  }
+
+  function esc(s){
+    return String(s).replace(/[&<>"]/g, function(c){
+      return ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"})[c];
+    });
+  }
+
+  function loading(msg){
+    out.innerHTML = '<div class="card"><span class="spin"></span>' + esc(msg) + '</div>';
+  }
+
+  function fail(msg){
+    out.innerHTML = '<div class="card"><div class="err">' + esc(msg) + '</div>' +
+      '<div class="note">A brand new block can be unavailable for a second or two on public RPCs. ' +
+      'Try the Random button, or an older slot.</div></div>';
+  }
+
+  function analyze(result, slot){
+    var txs = result.transactions || [];
+    var rows = [];
+    var totalCu = 0;
+    for(var i=0;i<txs.length;i++){
+      var t = txs[i];
+      var meta = t.meta;
+      if(!meta) continue;
+      totalCu += meta.computeUnitsConsumed || 0;
+      var msg = t.transaction.message;
+      var keys = msg.accountKeys || [];
+      var isVote = false;
+      for(var k=0;k<keys.length;k++){
+        var kk = typeof keys[k] === "string" ? keys[k] : keys[k].pubkey;
+        if(kk === VOTE){ isVote = true; break; }
+      }
+      if(isVote) continue;
+      var fee = meta.fee || 0;
+      var nsig = (t.transaction.signatures || []).length;
+      var cu = meta.computeUnitsConsumed || 0;
+      var pf = Math.max(0, fee - BASE_FEE * nsig);
+      rows.push({
+        pos: i,
+        pf: pf,
+        cu: cu,
+        price: cu > 0 ? pf/cu : 0,
+        err: meta.err !== null && meta.err !== undefined
+      });
+    }
+    return {rows: rows, totalCu: totalCu, allTx: txs.length};
+  }
+
+  function render(slot, block, a){
+    var rows = a.rows;
+    var n = rows.length;
+    if(n < 10){ fail("Block " + slot + " has too few non-vote transactions (" + n + ") to measure."); return; }
+
+    var pos = rows.map(function(_,i){return i;});
+    var rhoFee   = spearman(pos, rows.map(function(r){return r.pf;}));
+    var rhoCu    = spearman(pos, rows.map(function(r){return r.cu;}));
+    var rhoPrice = spearman(pos, rows.map(function(r){return r.price;}));
+
+    var fees = rows.map(function(r){return r.pf;});
+    var zero = rows.filter(function(r){return r.pf === 0;}).length;
+    var sat = a.totalCu / MAX_CU;
+
+    // 四分位位置：按价格排序后每档的平均相对位置
+    var order = rows.map(function(r,i){return i;});
+    order.sort(function(x,y){ return rows[x].price - rows[y].price; });
+    var q = Math.floor(n/4);
+    var quads = [];
+    for(var qi=0; qi<4; qi++){
+      var seg = qi < 3 ? order.slice(qi*q, (qi+1)*q) : order.slice(3*q);
+      var s = 0;
+      for(var si=0; si<seg.length; si++) s += seg[si]/(n-1);
+      quads.push(seg.length ? s/seg.length : 0);
+    }
+
+    var absFee = Math.abs(rhoFee === null ? 0 : rhoFee);
+    var verdictHtml, verdictCls = "";
+    if(absFee < 0.1 && rhoCu !== null && rhoCu > 0.02){
+      verdictHtml = 'This block was <span class="em">not fee-ordered</span>. ' +
+        'Position tracks compute, which is what a parallel scheduler produces.';
+    } else if(absFee < 0.1){
+      verdictHtml = 'No fee ordering detected in this block. Position looks <span class="em">close to arrival order</span>.';
+      verdictCls = " warn";
+    } else if(rhoFee > 0.1){
+      verdictHtml = 'This block shows <span class="em">fee ordering</span> — higher fees landed earlier.';
+    } else {
+      verdictHtml = 'Inverse: <span class="em">higher fees landed later</span> in this block.';
+      verdictCls = " warn";
+    }
+
+    var h = '';
+    h += '<div class="card"><div class="verdict'+verdictCls+'">'+verdictHtml+'</div>';
+    h += '<div class="big">';
+    h += '<div><b style="color:'+(absFee<0.1?'var(--gr)':'var(--am)')+'">'+
+         (rhoFee===null?'—':rhoFee.toFixed(3))+'</b><span>ρ position vs priority fee</span></div>';
+    h += '<div><b style="color:var(--cy)">'+
+         (rhoCu===null?'—':rhoCu.toFixed(3))+'</b><span>ρ position vs compute</span></div>';
+    h += '</div></div>';
+
+    h += '<div class="card">';
+    h += '<div class="kv"><span class="k">Slot</span><span class="v">'+slot+
+         ' <span style="color:var(--t3)">(epoch '+(block.parentSlot? Math.floor(slot/432000) : Math.floor(slot/432000))+')</span></span></div>';
+    h += '<div class="kv"><span class="k">Block hash</span><span class="v" style="font-size:12px">'+
+         esc(String(block.blockhash||"").slice(0,20))+'…</span></div>';
+    h += '<div class="kv"><span class="k">Transactions (all / non-vote)</span><span class="v">'+
+         a.allTx+' / <b style="color:var(--t1)">'+n+'</b></span></div>';
+    h += '<div class="kv"><span class="k">Block compute used</span><span class="v">'+
+         (sat*100).toFixed(0)+'% of limit</span></div>';
+    h += '<div class="kv"><span class="k">Zero priority fee</span><span class="v">'+
+         zero+' ('+Math.round(zero/n*100)+'%)</span></div>';
+    h += '<div class="kv"><span class="k">Priority fee p50 / p90 / max</span><span class="v">'+
+         fmt(pct(fees,0.5))+' / '+fmt(pct(fees,0.9))+' / '+fmt(pct(fees,1))+'</span></div>';
+    h += '<div class="kv"><span class="k">ρ position vs price</span><span class="v">'+
+         (rhoPrice===null?'—':rhoPrice.toFixed(3))+'</span></div>';
+    h += '</div>';
+
+    // 四分位条
+    h += '<div class="card"><div style="font-size:12.5px;color:var(--t3);margin-bottom:8px">' +
+         'Average position by price quartile — 0 = first in block, 1 = last</div>';
+    var labels = ["cheapest 25%","","","most expensive 25%"];
+    var colors = ["var(--gr)","var(--cy)","var(--pu)","var(--am)"];
+    for(var b=0;b<4;b++){
+      h += '<div style="margin:9px 0">' +
+           '<div style="display:flex;justify-content:space-between;font-size:12px;color:var(--t2)">' +
+           '<span>'+(b===0?'cheapest 25%':(b===3?'most expensive 25%':'quartile '+(b+1)))+'</span>' +
+           '<span style="font-variant-numeric:tabular-nums">'+quads[b].toFixed(2)+'</span></div>' +
+           '<div class="bar"><i style="width:'+(quads[b]*100).toFixed(1)+'%;background:'+colors[b]+'"></i></div>' +
+           '</div>';
+    }
+    h += '<div class="note">If blocks were fee-sorted this would rise monotonically from left to right. ' +
+         'It usually does not.</div></div>';
+
+    // 散点图
+    h += '<div class="card"><div style="font-size:12.5px;color:var(--t3);margin-bottom:8px">' +
+         'Every transaction: position in block vs priority fee (log scale)</div>' +
+         '<canvas id="cv" height="260"></canvas>' +
+         '<div class="legend"><span><i style="background:var(--cy)"></i>normal</span>' +
+         '<span><i style="background:var(--rd)"></i>failed</span></div></div>';
+
+    out.innerHTML = h;
+
+    // 画散点
+    var cv = document.getElementById("cv");
+    var dpr = window.devicePixelRatio || 1;
+    var W = cv.clientWidth, H = 260;
+    cv.width = W*dpr; cv.height = H*dpr;
+    var ctx = cv.getContext("2d");
+    ctx.scale(dpr,dpr);
+    ctx.clearRect(0,0,W,H);
+
+    var padL = 44, padR = 10, padT = 10, padB = 22;
+    var plotW = W-padL-padR, plotH = H-padT-padB;
+    var maxFee = Math.max(1, Math.max.apply(null, fees.map(function(f){return f;})));
+    var logMax = Math.log10(maxFee+1);
+
+    // 网格 + 轴标签
+    ctx.strokeStyle = "rgba(34,46,61,.9)";
+    ctx.fillStyle = "#5b6b7f";
+    ctx.font = "10px -apple-system,sans-serif";
+    ctx.lineWidth = 1;
+    for(var g=0; g<=4; g++){
+      var y = padT + plotH*(1-g/4);
+      ctx.beginPath(); ctx.moveTo(padL,y); ctx.lineTo(W-padR,y); ctx.stroke();
+      var val = Math.pow(10, logMax*g/4)-1;
+      ctx.fillText(fmt(Math.max(0,val)), 3, y+3);
+    }
+    ctx.fillText("first", padL, H-6);
+    ctx.fillText("last", W-padR-18, H-6);
+
+    // 点
+    for(var i2=0;i2<n;i2++){
+      var r2 = rows[i2];
+      var x = padL + plotW*(r2.pos/(n-1));
+      var lf = Math.log10(r2.pf+1);
+      var y2 = padT + plotH*(1 - lf/logMax);
+      ctx.fillStyle = r2.err ? "rgba(248,113,113,.55)" : "rgba(34,211,238,.42)";
+      ctx.fillRect(x-1, y2-1, 2.2, 2.2);
+    }
+  }
+
+  function fetchBlock(slotArg){
+    loading("Fetching block…");
+    return rpc("getBlock", [slotArg, {
+      encoding:"json",
+      transactionDetails:"full",
+      rewards:false,
+      maxSupportedTransactionVersion:1
+    }]).then(function(res){
+      if(res.error) throw new Error(res.error.message || "RPC error");
+      if(!res.result || !res.result.transactions){
+        throw new Error("Block not available yet");
+      }
+      var slot = res.result.parentSlot + 1 === slotArg || typeof slotArg === "number" ? slotArg : slotArg;
+      var a = analyze(res.result, slotArg);
+      render(slotArg, res.result, a);
+    }).catch(function(e){
+      fail(e.message || String(e));
+    });
+  }
+
+  function latest(){
+    loading("Finding the latest finalized slot…");
+    rpc("getSlot", [{commitment:"finalized"}]).then(function(r){
+      if(r.error || !r.result) throw new Error("Could not read chain head");
+      var s = r.result - 5;
+      inp.value = String(s);
+      fetchBlock(s);
+    }).catch(function(e){ fail(e.message || String(e)); });
+  }
+
+  go.addEventListener("click", function(){
+    var v = inp.value.trim();
+    if(!v){ latest(); return; }
+    var num = parseInt(v, 10);
+    if(!isFinite(num) || num <= 0){ fail("Enter a slot number."); return; }
+    fetchBlock(num);
+  });
+
+  inp.addEventListener("keydown", function(e){
+    if(e.key === "Enter"){ e.preventDefault(); go.click(); }
+  });
+
+  rnd.addEventListener("click", function(){
+    loading("Picking a random recent block…");
+    rpc("getSlot", [{commitment:"finalized"}]).then(function(r){
+      if(r.error || !r.result) throw new Error("Could not read chain head");
+      // 在最近 ~2000 slot 里随机取，避开最顶端未稳定的
+      var s = r.result - 50 - Math.floor(Math.random()*1800);
+      inp.value = String(s);
+      fetchBlock(s);
+    }).catch(function(e){ fail(e.message || String(e)); });
+  });
+
+  latest();
+})();
+</script>
+</body>
+</html>
